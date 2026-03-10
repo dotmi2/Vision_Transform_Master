@@ -20,4 +20,4 @@
 
 本项目在开发过程中参考了以下优秀项目：
 
-* **(https://gitee.com/link?target=https%3A%2F%2Fgithub.com%2Fouyangyanhuo%2Fcam_distortion_correction)** - 参考了其去畸变算法的底层实现逻辑。
+* **(https://github.com/ouyangyanhuo/cam_distortion_correction)** - 参考了其去畸变算法的底层实现逻辑。

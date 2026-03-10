@@ -1,2 +1,7 @@
 # 生成的文件
-.pyc
+*.pyc
+__pycache__/
+build/
+dist/
+*.spec
+.vision_history.json

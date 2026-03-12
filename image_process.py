@@ -75,7 +75,8 @@ def compute_forward_point_map(
     dist_coeffs: np.ndarray, 
     M: np.ndarray, 
     in_size: tuple = (160, 120), 
-    img_size: tuple = (640, 480)
+    img_size: tuple = (640, 480),
+    bev_size: tuple = (160, 120)
 ) -> tuple:
     """生成正向物理点映射表"""
     in_w, in_h = in_size
@@ -102,6 +103,11 @@ def compute_forward_point_map(
     
     map_w = bev_pts[:, 0, 0].reshape(in_h, in_w).astype(np.float32)
     map_h = bev_pts[:, 0, 1].reshape(in_h, in_w).astype(np.float32)
+
+    bev_w, bev_h = bev_size
+    valid = ((map_w >= 0) & (map_w < bev_w) & (map_h >= 0) & (map_h < bev_h))
+    map_w[~valid] = -1
+    map_h[~valid] = -1
     
     return map_h, map_w
 
@@ -157,7 +163,6 @@ def export_table_c(
                 f.write(f"{{{vals}}}{comma}\n")
             f.write("};\n")
         print(f"Exported: {filepath}")
-
 
 # ============================================================
 # 4. 全局状态：用于鼠标回调

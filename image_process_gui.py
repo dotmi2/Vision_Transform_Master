@@ -38,7 +38,7 @@ from qfluentwidgets import (
 )
 
 from image_process import (
-    undistort, compute_undist_inverse_map,
+    undistort, compute_backward_remap, compute_forward_point_map,
     export_table_python, export_table_c,
     K as DEFAULT_K, D as DEFAULT_D,
 )
@@ -556,12 +556,12 @@ class ClickableImageLabel(QLabel):
 # 打表多线程
 # ============================================================
 class MappingTaskThread(QThread):
-    """将 compute_undist_inverse_map + export 放入后台线程"""
+    """将映射计算 + export 放入后台线程"""
     progress = pyqtSignal(int)       # 0-100
     finished_ok = pyqtSignal(str)    # 导出目录
     finished_err = pyqtSignal(str)   # 错误信息
 
-    def __init__(self, K, D, M, out_size, img_size, out_dir, export_format="python", parent=None):
+    def __init__(self, K, D, M, out_size, img_size, out_dir, export_format="python", mode="backward", parent=None):
         super().__init__(parent)
         self._K = K
         self._D = D
@@ -570,24 +570,43 @@ class MappingTaskThread(QThread):
         self._img_size = img_size
         self._out_dir = out_dir
         self._fmt = export_format   # "python" | "c"
+        self._mode = mode           # "forward" | "backward"
 
     def run(self):
         try:
             self.progress.emit(10)
-            map_h, map_w = compute_undist_inverse_map(
-                self._K, self._D, self._M, self._out_size, self._img_size
-            )
+            
+            if self._mode == "forward":
+                map_h, map_w = compute_forward_point_map(
+                    camera_matrix=self._K,
+                    dist_coeffs=self._D,
+                    M=self._M,
+                    in_size=self._out_size,
+                    img_size=self._img_size
+                )
+                name_h, name_w = "ForwardMapH", "ForwardMapW"
+            else:
+                map_h, map_w = compute_backward_remap(
+                    camera_matrix=self._K,
+                    dist_coeffs=self._D,
+                    M=self._M,
+                    out_size=self._out_size,
+                    img_size=self._img_size
+                )
+                name_h, name_w = "BackwardMapH", "BackwardMapW"
+                
             self.progress.emit(60)
+            
             if self._fmt == "python":
                 export_table_python(
                     map_h, map_w,
-                    "UndistInverseMapH", "UndistInverseMapW",
+                    name_h, name_w,
                     self._out_dir,
                 )
             else:
                 export_table_c(
                     map_h, map_w,
-                    "UndistInverseMapH", "UndistInverseMapW",
+                    name_h, name_w,
                     self._out_dir,
                 )
             self.progress.emit(100)
@@ -825,7 +844,8 @@ class PerspectiveInterface(QFrame):
         fmt = "python" if self.export_format_combo.currentIndex() == 0 else "c"
 
         K, D = self._get_KD()
-        img_size = (self._original_img.shape[0], self._original_img.shape[1])
+        img_h, img_w = self._original_img.shape[:2]
+        img_size = (img_w, img_h)
         
         # 获取目标输出尺寸
         mw = self._main_window()
@@ -844,12 +864,14 @@ class PerspectiveInterface(QFrame):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.btn_export.setEnabled(False)
+        
         fmt_label = "Python (.py)" if fmt == "python" else "C/C++ (.txt)"
-        self.status_label.setText(f"正在打表 [{fmt_label}] → {export_dir}")
+        mode_label = "正向"
+        self.status_label.setText(f"正在打表 [{mode_label} | {fmt_label}] → {export_dir}")
 
         self._mapping_thread = MappingTaskThread(
             K, D, self._perspective_M, out_size, img_size,
-            export_dir, export_format=fmt, parent=self
+            export_dir, export_format=fmt, mode="forward", parent=self
         )
         self._mapping_thread.progress.connect(self._on_mapping_progress)
         self._mapping_thread.finished_ok.connect(self._on_mapping_done)

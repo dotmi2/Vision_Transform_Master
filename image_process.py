@@ -38,50 +38,73 @@ def undistort(frame: np.ndarray, camera_matrix: np.ndarray, dist_coeffs: np.ndar
 # ============================================================
 # 3. 映射表计算与导出（参考 MATLAB 脚本的数学逻辑）
 # ============================================================
-def compute_undist_inverse_map(
+def compute_backward_remap(
     camera_matrix: np.ndarray,
     dist_coeffs: np.ndarray,
     M: np.ndarray,
-    out_size: tuple,
-    img_size: tuple,
+    out_size: tuple = (160, 120),
+    img_size: tuple = (640, 480),
 ) -> tuple:
-    """反向查表算法：从目标图像 (如 160x120) 反推回原始畸变图像的坐标"""
+    """生成反向映射表，带默认尺寸防御，防止传参错位"""
     out_w, out_h = out_size
-    h, w = img_size
+    img_w, img_h = img_size
 
-    # 1. 获取优化后的相机内参
-    new_matrix, _ = cv2.getOptimalNewCameraMatrix(
-        camera_matrix, dist_coeffs, (w, h), 1, (w, h)
+    map_x, map_y = cv2.initUndistortRectifyMap(
+        camera_matrix, dist_coeffs, None, camera_matrix, (img_w, img_h), cv2.CV_32FC1
     )
 
-    # 2. 生成目标输出图的网格坐标 (u, v)
     u, v = np.meshgrid(np.arange(out_w, dtype=np.float32),
                        np.arange(out_h, dtype=np.float32))
-    bev_pts = np.stack([u.ravel(), v.ravel()], axis=-1)
+    bev_pts = np.stack([u, v], axis=-1).reshape(-1, 1, 2)
 
-    # 3. 乘以 M 的逆矩阵，反推回“去畸变图像”上的坐标
     M_inv = np.linalg.inv(M)
-    bev_pts_h = np.concatenate([bev_pts, np.ones((bev_pts.shape[0], 1))], axis=-1)
-    undist_pts_h = bev_pts_h @ M_inv.T
-    undist_pts = undist_pts_h[:, :2] / undist_pts_h[:, 2:]
+    undist_pts = cv2.perspectiveTransform(bev_pts, M_inv)
 
-    # 4. 将去畸变像素坐标转为归一化相机坐标 (z=1 平面)
-    new_matrix_inv = np.linalg.inv(new_matrix)
-    undist_pts_h2 = np.concatenate([undist_pts, np.ones((undist_pts.shape[0], 1))], axis=-1)
-    norm_pts_h = undist_pts_h2 @ new_matrix_inv.T
-    norm_pts = norm_pts_h[:, :2] / norm_pts_h[:, 2:]
+    undist_x = undist_pts[:, 0, 0].reshape(out_h, out_w).astype(np.float32)
+    undist_y = undist_pts[:, 0, 1].reshape(out_h, out_w).astype(np.float32)
 
-    # 5. 利用 projectPoints，将归一化坐标重新“加上畸变”，投影回原始像素坐标
-    obj_pts = np.concatenate([norm_pts, np.ones((norm_pts.shape[0], 1))], axis=-1).astype(np.float32)
-    rvec = np.zeros((3, 1), dtype=np.float64)
-    tvec = np.zeros((3, 1), dtype=np.float64)
-    dist_pts, _ = cv2.projectPoints(obj_pts, rvec, tvec, camera_matrix, dist_coeffs)
-    dist_pts = dist_pts.reshape(-1, 2)
+    # 越界奇点填为 -1，C++ 手写循环遇到负数直接填黑即可
+    dist_x = cv2.remap(map_x, undist_x, undist_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=-1)
+    dist_y = cv2.remap(map_y, undist_x, undist_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=-1)
 
-    map_w = dist_pts[:, 0].reshape(out_h, out_w)
-    map_h = dist_pts[:, 1].reshape(out_h, out_w)
+    return dist_y, dist_x
 
+
+def compute_forward_point_map(
+    camera_matrix: np.ndarray, 
+    dist_coeffs: np.ndarray, 
+    M: np.ndarray, 
+    in_size: tuple = (160, 120), 
+    img_size: tuple = (640, 480)
+) -> tuple:
+    """生成正向物理点映射表"""
+    in_w, in_h = in_size
+    img_w, img_h = img_size
+    
+    xs, ys = np.meshgrid(np.arange(in_w, dtype=np.float32),
+                         np.arange(in_h, dtype=np.float32))
+    
+    scale_x = img_w / float(in_w)
+    scale_y = img_h / float(in_h)
+    
+    xs_scaled = xs * scale_x
+    ys_scaled = ys * scale_y
+    
+    pts = np.stack([xs_scaled, ys_scaled], axis=-1).reshape(-1, 1, 2)
+    
+    new_matrix, _ = cv2.getOptimalNewCameraMatrix(
+        camera_matrix, dist_coeffs, (img_w, img_h), 1, (img_w, img_h)
+    )
+    
+    undist_pts = cv2.undistortPoints(pts, camera_matrix, dist_coeffs, P=new_matrix)
+    
+    bev_pts = cv2.perspectiveTransform(undist_pts, M)
+    
+    map_w = bev_pts[:, 0, 0].reshape(in_h, in_w).astype(np.float32)
+    map_h = bev_pts[:, 0, 1].reshape(in_h, in_w).astype(np.float32)
+    
     return map_h, map_w
+
 
 
 def export_table_python(
@@ -103,7 +126,7 @@ def export_table_python(
         with open(filepath, "w") as f:
             f.write(f"{name} = [\n")
             for row_idx in range(h):
-                vals = ", ".join(f"{data[row_idx, col]:.2f}" for col in range(w))
+                vals = ", ".join("{:.2f}".format(float(data[row_idx, col])) for col in range(w))
                 comma = "," if row_idx < h - 1 else ""
                 f.write(f"    [{vals}]{comma}\n")
             f.write("]\n")
@@ -129,7 +152,7 @@ def export_table_c(
         with open(filepath, "w") as f:
             f.write(f"const float {name}[{h}][{w}] = {{\n")
             for row_idx in range(h):
-                vals = ", ".join(f"{data[row_idx, col]:.2f}" for col in range(w))
+                vals = ", ".join("{:.2f}".format(float(data[row_idx, col])) for col in range(w))
                 comma = "," if row_idx < h - 1 else ""
                 f.write(f"{{{vals}}}{comma}\n")
             f.write("};\n")
@@ -210,9 +233,15 @@ def on_mouse_click(event, x, y, flags, param):
         cv2.imshow(WIN_PERSPECTIVE, result)
 
         # --- 计算并导出映射表 ---
-        img_size = (original_img.shape[0], original_img.shape[1])
-        print(f"Computing undist+inverse mapping table for {img_size[1]}x{img_size[0]}...")
-        map_h, map_w = compute_undist_inverse_map(K, D, M, img_size)
+        img_size = (original_img.shape[1], original_img.shape[0])
+        print(f"Computing backward mapping table for {img_size[0]}x{img_size[1]}...")
+        map_h, map_w = compute_backward_remap(
+            camera_matrix=K,
+            dist_coeffs=D,
+            M=M,
+            out_size=(out_w, out_h),
+            img_size=img_size
+        )
 
         # 导出 Python 格式
         export_table_python(map_h, map_w,

@@ -7,6 +7,27 @@ import sys
 import cv2
 import numpy as np
 
+def scale_camera_matrix(K: np.ndarray, orig_size: tuple, new_size: tuple) -> np.ndarray:
+    """
+    按分辨率比例动态缩放相机内参 K。
+    orig_size: (width, height) 标定时的分辨率，如 (640, 480)
+    new_size:  (width, height) 当前图片的分辨率，如 (160, 120)
+    """
+    orig_w, orig_h = orig_size
+    new_w, new_h = new_size
+
+    scale_x = new_w / orig_w
+    scale_y = new_h / orig_h
+
+    K_new = K.copy().astype(np.float32)
+    K_new[0, 0] *= scale_x  # 缩放 fx
+    K_new[0, 2] *= scale_x  # 缩放 cx
+    K_new[1, 1] *= scale_y  # 缩放 fy
+    K_new[1, 2] *= scale_y  # 缩放 cy
+    
+    return K_new
+
+
 # ============================================================
 # 1. 硬编码相机内参矩阵 K 和畸变系数 D（伪造值，用于测试）
 # ============================================================
@@ -24,15 +45,26 @@ D = np.array([-0.05, 0.01, 0.0, 0.0, 0.0], dtype=np.float64)
 # ============================================================
 # 2. 去畸变函数（参考 camera.py 的 _undistort 方法）
 # ============================================================
-def undistort(frame: np.ndarray, camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> np.ndarray:
-    """对输入图像进行去畸变处理"""
-    h, w = frame.shape[:2]
-    # alpha=1 保留所有原始像素
-    new_matrix, roi = cv2.getOptimalNewCameraMatrix(
-        camera_matrix, dist_coeffs, (w, h), 1, (w, h)
-    )
-    undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs, None, new_matrix)
-    return undistorted
+def undistort(img: np.ndarray, K: np.ndarray, D: np.ndarray, calib_size: tuple = (640, 480)) -> np.ndarray:
+    """
+    去畸变函数 (自带分辨率自适应缩放功能)
+    calib_size: 默认该 K 矩阵是在 640x480 分辨率下标定得出的。
+    """
+    h, w = img.shape[:2]
+    
+    # 1. 动态自适应 K 矩阵
+    if (w, h) != calib_size:
+        K_work = scale_camera_matrix(K, calib_size, (w, h))
+    else:
+        K_work = K.copy()
+
+    # 2. 计算新的最优内参 (保留全图视野，alpha=1)
+    new_K, roi = cv2.getOptimalNewCameraMatrix(K_work, D, (w, h), 1, (w, h))
+    
+    # 3. 执行真正的去畸变 (注意这里传入的是 K_work 而不是旧的 K)
+    undist_img = cv2.undistort(img, K_work, D, None, new_K)
+    
+    return undist_img
 
 
 # ============================================================
@@ -71,46 +103,58 @@ def compute_backward_remap(
 
 
 def compute_forward_point_map(
-    camera_matrix: np.ndarray, 
-    dist_coeffs: np.ndarray, 
-    M: np.ndarray, 
-    in_size: tuple = (160, 120), 
-    img_size: tuple = (640, 480),
-    bev_size: tuple = (160, 120)
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    M: np.ndarray,
+    in_size: tuple = (160, 120),  # 下位机 C++ 巡线时的真实输入分辨率
+    img_size: tuple = (640, 480), # 你在 GUI 里加载测试图片的真实分辨率
+    calib_size: tuple = (640, 480), # 最初相机的标定分辨率 (默认 640x480)
+    bev_size: tuple = None
 ) -> tuple:
-    """生成正向物理点映射表"""
+    """
+    生成前向点表: 输入图点 (x, y) -> BEV 点 (u, v) (自带分辨率自适应)
+    """
+    if bev_size is None:
+        bev_size = in_size
     in_w, in_h = in_size
     img_w, img_h = img_size
-    
-    xs, ys = np.meshgrid(np.arange(in_w, dtype=np.float32),
-                         np.arange(in_h, dtype=np.float32))
-    
-    scale_x = img_w / float(in_w)
-    scale_y = img_h / float(in_h)
-    
-    xs_scaled = xs * scale_x
-    ys_scaled = ys * scale_y
-    
-    pts = np.stack([xs_scaled, ys_scaled], axis=-1).reshape(-1, 1, 2)
-    
-    new_matrix, _ = cv2.getOptimalNewCameraMatrix(
-        camera_matrix, dist_coeffs, (img_w, img_h), 1, (img_w, img_h)
+
+    # 1. 核心修复：动态缩放 K 矩阵到下位机巡线尺寸 in_size
+    K_in = scale_camera_matrix(camera_matrix, calib_size, in_size)
+    new_K_in, _ = cv2.getOptimalNewCameraMatrix(K_in, dist_coeffs, in_size, 1, in_size)
+
+    # 2. 生成 in_size (160x120) 的网格坐标
+    xs, ys = np.meshgrid(
+        np.arange(in_w, dtype=np.float32),
+        np.arange(in_h, dtype=np.float32)
     )
-    
-    undist_pts = cv2.undistortPoints(pts, camera_matrix, dist_coeffs, P=new_matrix)
-    
-    bev_pts = cv2.perspectiveTransform(undist_pts, M)
-    
-    map_w = bev_pts[:, 0, 0].reshape(in_h, in_w).astype(np.float32)
-    map_h = bev_pts[:, 0, 1].reshape(in_h, in_w).astype(np.float32)
+    pts_in = np.stack([xs, ys], axis=-1).reshape(-1, 1, 2)
 
-    bev_w, bev_h = bev_size
+    # 3. 使用【缩小后的 K 矩阵】在 160x120 空间下进行精准去畸变
+    undist_pts_in = cv2.undistortPoints(pts_in, K_in, dist_coeffs, P=new_K_in)
+
+    # 4. 将去畸变后的点，等比缩放到 M 矩阵所在的 GUI 截图空间
+    # (如果 GUI 里加载的就是 160x120 图片，这里 scale 就是 1，完美兼容)
+    scale_to_m_x = img_w / float(in_w)
+    scale_to_m_y = img_h / float(in_h)
+    undist_pts_img = undist_pts_in.copy()
+    undist_pts_img[:, 0, 0] *= scale_to_m_x
+    undist_pts_img[:, 0, 1] *= scale_to_m_y
+
+    # 5. 施加透视变换矩阵 M
+    bev_pts = cv2.perspectiveTransform(undist_pts_img, M).reshape(-1, 2)
+
+    map_w = bev_pts[:, 0].reshape(in_h, in_w).astype(np.float32)
+    map_h = bev_pts[:, 1].reshape(in_h, in_w).astype(np.float32)
+
+    # 6. 掩码与越界钳位 (-1 哨兵值保护)
+    bev_w, bev_h = in_size # C++ 中 BEV 画布尺寸与 in_size 一致
     valid = ((map_w >= 0) & (map_w < bev_w) & (map_h >= 0) & (map_h < bev_h))
-    map_w[~valid] = -1
-    map_h[~valid] = -1
     
-    return map_h, map_w
+    map_w[~valid] = -1.0
+    map_h[~valid] = -1.0
 
+    return map_h, map_w
 
 
 def export_table_python(

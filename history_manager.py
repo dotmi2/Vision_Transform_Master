@@ -59,6 +59,8 @@ class HistoryManager:
         avg_error: float,
         K: np.ndarray,
         D: np.ndarray,
+        model: str = "pinhole",
+        image_size: Optional[tuple] = None,
     ) -> Dict:
         """新增一条标定记录并持久化。如果同名则自动加后缀。"""
         # --- 新增：防重名逻辑 ---
@@ -76,9 +78,13 @@ class HistoryManager:
             "date": self._now(),
             "image_count": image_count,
             "avg_error": round(avg_error, 6),
+            "model": model,
             "K": K.tolist() if isinstance(K, np.ndarray) else K,
             "D": D.flatten().tolist() if isinstance(D, np.ndarray) else D,
         }
+        if image_size is not None:
+            record["image_width"] = int(image_size[0])
+            record["image_height"] = int(image_size[1])
         self._data["calibration_records"].append(record)
         self._save()
         return record
@@ -189,27 +195,69 @@ class HistoryManager:
         filepath: str,
         K: np.ndarray,
         D: np.ndarray,
+        model: str = "pinhole",
+        image_size: Optional[tuple] = None,
+        reprojection_error: Optional[float] = None,
     ):
         """将内参矩阵 K 和畸变系数 D 导出为 YAML 文件。"""
         fs = cv2.FileStorage(filepath, cv2.FILE_STORAGE_WRITE)
+        if image_size is not None:
+            fs.write("image_width", int(image_size[0]))
+            fs.write("image_height", int(image_size[1]))
+        fs.write("model", model)
         fs.write("camera_matrix", K.astype(np.float64))
         fs.write("dist_coeffs", D.reshape(-1, 1).astype(np.float64))
+        fs.write("distortion_coefficients", D.reshape(-1, 1).astype(np.float64))
+        if reprojection_error is not None:
+            fs.write("reprojection_error", float(reprojection_error))
         fs.release()
 
     @staticmethod
-    def import_calibration_from_yaml(filepath: str):
+    def import_calibration_bundle_from_yaml(filepath: str) -> Dict:
         """
         从 YAML 文件读取内参矩阵和畸变系数。
-        返回 (K, D) 元组，读取失败时抛出 ValueError。
+        返回包含 K/D/model/image_size 的字典，读取失败时抛出 ValueError。
         """
         if not os.path.isfile(filepath):
             raise FileNotFoundError(f"文件不存在: {filepath}")
         fs = cv2.FileStorage(filepath, cv2.FILE_STORAGE_READ)
-        K = fs.getNode("camera_matrix").mat()
-        D = fs.getNode("dist_coeffs").mat()
-        fs.release()
+        try:
+            K = fs.getNode("camera_matrix").mat()
+            D = fs.getNode("dist_coeffs").mat()
+            if D is None:
+                D = fs.getNode("distortion_coefficients").mat()
+
+            model_node = fs.getNode("model")
+            model = model_node.string() if not model_node.empty() else "pinhole"
+
+            width_node = fs.getNode("image_width")
+            height_node = fs.getNode("image_height")
+            image_width = int(width_node.real()) if not width_node.empty() else None
+            image_height = int(height_node.real()) if not height_node.empty() else None
+
+            err_node = fs.getNode("reprojection_error")
+            reprojection_error = float(err_node.real()) if not err_node.empty() else None
+        finally:
+            fs.release()
+
         if K is None or D is None:
             raise ValueError(
-                "YAML 文件中未找到 camera_matrix 或 dist_coeffs 节点"
+                "YAML 文件中未找到 camera_matrix 或 dist_coeffs/distortion_coefficients 节点"
             )
-        return K, D
+
+        image_size = None
+        if image_width is not None and image_height is not None:
+            image_size = (image_width, image_height)
+
+        return {
+            "K": K,
+            "D": D,
+            "model": model or "pinhole",
+            "image_size": image_size,
+            "reprojection_error": reprojection_error,
+        }
+
+    @staticmethod
+    def import_calibration_from_yaml(filepath: str):
+        bundle = HistoryManager.import_calibration_bundle_from_yaml(filepath)
+        return bundle["K"], bundle["D"]

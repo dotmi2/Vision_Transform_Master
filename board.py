@@ -20,22 +20,40 @@ class BoardManager:
 
     def set_board_type(self, board_type: str, **kwargs) -> str:
         """Set board type and parameters"""
+        if board_type not in ("chessboard", "charuco"):
+            raise ValueError(f"Unknown board type: {board_type}")
+
         self.board_type = board_type
 
         if board_type == "chessboard":
             if 'chessboard_size' in kwargs:
-                self.chessboard_size = tuple(kwargs['chessboard_size'])
+                chessboard_size = tuple(kwargs['chessboard_size'])
+                if len(chessboard_size) != 2 or min(chessboard_size) <= 0:
+                    raise ValueError("chessboard_size must contain two positive inner-corner counts")
+                self.chessboard_size = chessboard_size
             if 'square_size' in kwargs:
-                self.square_size = float(kwargs['square_size'])
+                square_size = float(kwargs['square_size'])
+                if square_size <= 0:
+                    raise ValueError("square_size must be positive")
+                self.square_size = square_size
         elif board_type == "charuco":
             if 'dict_name' in kwargs:
-                dict_id = getattr(cv2.aruco, kwargs['dict_name'])
+                dict_name = kwargs['dict_name']
+                if not hasattr(cv2.aruco, dict_name):
+                    raise ValueError(f"Unknown ArUco dictionary: {dict_name}")
+                dict_id = getattr(cv2.aruco, dict_name)
                 self.dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
 
-            squares_x = kwargs.get('squares_x', 7)
-            squares_y = kwargs.get('squares_y', 10)
-            square_len = kwargs.get('square_len', 25.0)
-            marker_len = kwargs.get('marker_len', 17.5)
+            squares_x = int(kwargs.get('squares_x', 7))
+            squares_y = int(kwargs.get('squares_y', 10))
+            square_len = float(kwargs.get('square_len', 25.0))
+            marker_len = float(kwargs.get('marker_len', 17.5))
+            if squares_x < 2 or squares_y < 2:
+                raise ValueError("ChArUco board must have at least 2 squares in each direction")
+            if square_len <= 0 or marker_len <= 0:
+                raise ValueError("square_len and marker_len must be positive")
+            if marker_len >= square_len:
+                raise ValueError("marker_len must be smaller than square_len")
 
             self.board = cv2.aruco.CharucoBoard(
                 (squares_x, squares_y), square_len, marker_len, self.dictionary
@@ -114,9 +132,11 @@ class BoardManager:
             return cv2.cvtColor(board_img, cv2.COLOR_BGR2RGB)
 
     def _generate_chessboard(self, width: int, height: int) -> np.ndarray:
-        """Generate chessboard image"""
-        cols, rows = self.chessboard_size
+        """Generate chessboard image. chessboard_size stores inner-corner counts."""
+        inner_cols, inner_rows = self.chessboard_size
         sq = 50
+        cols = inner_cols + 1
+        rows = inner_rows + 1
         board_w, board_h = cols * sq, rows * sq
         img = np.zeros((board_h, board_w, 3), dtype=np.uint8)
 

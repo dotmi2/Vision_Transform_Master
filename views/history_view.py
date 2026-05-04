@@ -143,11 +143,18 @@ class HistoryInterface(QFrame):
         self._calib_ids = [r["id"] for r in calib_records]
         self.calib_table.setRowCount(len(calib_records))
         for i, r in enumerate(calib_records):
+            img_count = r.get("image_count", 0)
+            avg_err = r.get("avg_error", 0)
+
+            # 如果是 0，说明是外部导入的 YAML，显示更友好的文字
+            img_count_str = str(img_count) if img_count > 0 else "外部导入"
+            avg_err_str = f"{avg_err:.4f}" if img_count > 0 else "-"
+
             items = [
                 QTableWidgetItem(r.get("name", "")),
                 QTableWidgetItem(r.get("date", "")),
-                QTableWidgetItem(str(r.get("image_count", ""))),
-                QTableWidgetItem(f"{r.get('avg_error', 0):.4f}"),
+                QTableWidgetItem(img_count_str),
+                QTableWidgetItem(avg_err_str),
             ]
             for col, item in enumerate(items):
                 item.setTextAlignment(Qt.AlignCenter)
@@ -203,8 +210,14 @@ class HistoryInterface(QFrame):
             ci = mw.calibration_interface
             ci._K = K
             ci._D = D
+            ci._model = rec.get("model", "pinhole")
+            if rec.get("image_width") and rec.get("image_height"):
+                ci._calib_size = (int(rec["image_width"]), int(rec["image_height"]))
+            else:
+                ci._calib_size = (640, 480)
             ci.calib_status_label.setText(
-                f"✅ 已应用历史参数\n来源: {rec.get('name', '')}"
+                f"✅ 已应用历史参数\n来源: {rec.get('name', '')}\n"
+                f"模型: {ci._model}  分辨率: {ci._calib_size[0]}×{ci._calib_size[1]}"
             )
             w = MessageBox("应用成功", f"已将「{rec['name']}」的 K/D 参数加载到内存中。", mw)
             w.yesButton.setText("确定")
@@ -263,7 +276,17 @@ class HistoryInterface(QFrame):
             return
         K = np.array(rec["K"], dtype=np.float64)
         D = np.array(rec["D"], dtype=np.float64).reshape(-1, 1)
-        self.history_mgr.export_calibration_to_yaml(path, K, D)
+        image_size = None
+        if rec.get("image_width") and rec.get("image_height"):
+            image_size = (int(rec["image_width"]), int(rec["image_height"]))
+        self.history_mgr.export_calibration_to_yaml(
+            path,
+            K,
+            D,
+            model=rec.get("model", "pinhole"),
+            image_size=image_size,
+            reprojection_error=rec.get("avg_error"),
+        )
         w = MessageBox("导出成功", f"YAML 已保存到:\n{path}", self.window())
         w.yesButton.setText("确定")
         w.cancelButton.setText("取消")

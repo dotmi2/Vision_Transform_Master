@@ -14,7 +14,7 @@ from qfluentwidgets import (
 
 from image_process import (
     undistort, compute_backward_remap, compute_forward_point_map,
-    export_table_python, export_table_c,
+    export_table_python, export_table_c, order_points, scale_camera_matrix,
     K as DEFAULT_K, D as DEFAULT_D
 )
 
@@ -115,7 +115,21 @@ class MappingTaskThread(QThread):
     finished_ok = pyqtSignal(str)    # 导出目录
     finished_err = pyqtSignal(str)   # 错误信息
 
-    def __init__(self, K, D, M, out_size, img_size, out_dir, export_format="python", mode="backward", parent=None):
+    def __init__(
+        self,
+        K,
+        D,
+        M,
+        out_size,
+        img_size,
+        out_dir,
+        export_format="python",
+        mode="backward",
+        calib_size=(640, 480),
+        model="pinhole",
+        new_camera_matrix=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self._K = K
         self._D = D
@@ -125,6 +139,9 @@ class MappingTaskThread(QThread):
         self._out_dir = out_dir
         self._fmt = export_format   # "python" | "c"
         self._mode = mode           # "forward" | "backward"
+        self._calib_size = calib_size
+        self._model = model
+        self._new_K = new_camera_matrix
 
     def run(self):
         try:
@@ -137,16 +154,22 @@ class MappingTaskThread(QThread):
                     M=self._M,
                     in_size=(160, 120),
                     img_size=self._img_size,
-                    bev_size=self._out_size
+                    calib_size=self._calib_size,
+                    bev_size=self._out_size,
+                    new_camera_matrix=self._new_K,
+                    model=self._model,
                 )
                 name_h, name_w = "ForwardMapH", "ForwardMapW"
             else:
+                K_work = scale_camera_matrix(self._K, self._calib_size, self._img_size)
                 map_h, map_w = compute_backward_remap(
-                    camera_matrix=self._K,
+                    camera_matrix=K_work,
                     dist_coeffs=self._D,
                     M=self._M,
                     out_size=self._out_size,
-                    img_size=self._img_size
+                    img_size=self._img_size,
+                    new_camera_matrix=self._new_K,
+                    model=self._model,
                 )
                 name_h, name_w = "BackwardMapH", "BackwardMapW"
                 
@@ -184,6 +207,12 @@ class PerspectiveInterface(QFrame):
         # 内部状态
         self._original_img = None
         self._undistorted_img = None
+        self._working_K = None
+        self._preview_K = None
+        self._calib_K = DEFAULT_K.copy()
+        self._calib_D = DEFAULT_D.copy()
+        self._calib_size = (640, 480)
+        self._calib_model = "pinhole"
         self._perspective_M = None
         self._mapping_thread = None
 
@@ -200,12 +229,18 @@ class PerspectiveInterface(QFrame):
 
     # ---------- 辅助：获取当前 K / D ----------
     def _get_KD(self):
+        K, D, _, _ = self._get_calibration()
+        return K, D
+
+    def _get_calibration(self):
         mw = self._main_window()
         if mw and hasattr(mw, 'calibration_interface'):
             ci = mw.calibration_interface
             if hasattr(ci, '_K'):
-                return ci._K, ci._D
-        return DEFAULT_K.copy(), DEFAULT_D.copy()
+                model = getattr(ci, '_model', 'pinhole')
+                calib_size = getattr(ci, '_calib_size', (640, 480))
+                return ci._K, ci._D, model, calib_size
+        return DEFAULT_K.copy(), DEFAULT_D.copy(), "pinhole", (640, 480)
 
     # ---------- UI ----------
     def _init_ui(self):
@@ -215,7 +250,7 @@ class PerspectiveInterface(QFrame):
 
         # 顶部操作提示
         tip = CaptionLabel(
-            "提示：请在去畸变图上按【左上 → 右上 → 左下 → 右下】的顺序依次点击 4 个顶点。"
+            "提示：请在去畸变图上点击目标区域 4 个顶点，系统会自动整理四点顺序。"
         )
         tip.setStyleSheet("color: rgba(255, 255, 255, 0.4);")
         root.addWidget(tip)
@@ -322,8 +357,17 @@ class PerspectiveInterface(QFrame):
             return
 
         self._original_img = img
-        K, D = self._get_KD()
-        self._undistorted_img = undistort(img, K, D)
+        K, D, self._calib_model, self._calib_size = self._get_calibration()
+        self._calib_K = K.copy()
+        self._calib_D = D.copy()
+        self._undistorted_img, self._working_K, self._preview_K = undistort(
+            img,
+            K,
+            D,
+            calib_size=self._calib_size,
+            model=self._calib_model,
+            return_matrices=True,
+        )
         self._perspective_M = None
 
         self.image_label_a.set_image(self._undistorted_img)
@@ -376,7 +420,11 @@ class PerspectiveInterface(QFrame):
             QMessageBox.warning(self, "参数错误", "请在设置页面填入有效数字")
             return
 
-        pts_src = np.float32(points)
+        try:
+            pts_src = order_points(points)
+        except ValueError as e:
+            QMessageBox.warning(self, "选点错误", str(e))
+            return
         pts_dst = np.float32([
             [imgdx,         imgdy],
             [imgdx + objdx, imgdy],
@@ -409,7 +457,8 @@ class PerspectiveInterface(QFrame):
         # 读取格式
         fmt = "python" if self.export_format_combo.currentIndex() == 0 else "c"
 
-        K, D = self._get_KD()
+        K, D = self._calib_K, self._calib_D
+        model, calib_size = self._calib_model, self._calib_size
         img_h, img_w = self._original_img.shape[:2]
         img_size = (img_w, img_h)
         
@@ -438,7 +487,13 @@ class PerspectiveInterface(QFrame):
 
         self._mapping_thread = MappingTaskThread(
             K, D, self._perspective_M, out_size, img_size,
-            export_dir, export_format=fmt, mode=mode, parent=self
+            export_dir,
+            export_format=fmt,
+            mode=mode,
+            calib_size=calib_size,
+            model=model,
+            new_camera_matrix=self._preview_K,
+            parent=self,
         )
         self._mapping_thread.progress.connect(self._on_mapping_progress)
         self._mapping_thread.finished_ok.connect(self._on_mapping_done)

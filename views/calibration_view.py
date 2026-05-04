@@ -34,6 +34,8 @@ class CalibrationInterface(QFrame):
         # 标定结果：默认使用硬编码参数
         self._K = DEFAULT_K.copy()
         self._D = DEFAULT_D.copy()
+        self._model = "pinhole"
+        self._calib_size = (640, 480)
 
         self.scroll_area = ScrollArea(self)
         self.scroll_area.setWidgetResizable(True)
@@ -167,6 +169,8 @@ class CalibrationInterface(QFrame):
         if ok:
             self._K = self._calib_engine.camera_matrix
             self._D = self._calib_engine.dist_coeffs
+            self._model = self._calib_engine.model
+            self._calib_size = self._calib_engine.image_size
             err = self._calib_engine.reprojection_error
             self.calib_status_label.setText(
                 f"✅ 标定成功 ({total} 张)\n"
@@ -189,6 +193,8 @@ class CalibrationInterface(QFrame):
                     avg_error=err,
                     K=self._K,
                     D=self._D,
+                    model=self._model,
+                    image_size=self._calib_size,
                 )
                 # 刷新历史页面
                 mw = self._main_window()
@@ -217,17 +223,35 @@ class CalibrationInterface(QFrame):
         if not path:
             return
         try:
-            fs = cv2.FileStorage(path, cv2.FILE_STORAGE_READ)
-            K = fs.getNode("camera_matrix").mat()
-            D = fs.getNode("dist_coeffs").mat()
-            fs.release()
-            if K is None or D is None:
-                raise ValueError("文件中未找到 camera_matrix 或 dist_coeffs")
-            self._K = K
-            self._D = D
+            bundle = HistoryManager.import_calibration_bundle_from_yaml(path)
+            self._K = bundle["K"]
+            self._D = bundle["D"]
+            self._model = bundle.get("model", "pinhole")
+            self._calib_size = bundle.get("image_size") or (640, 480)
             self.calib_status_label.setText(
-                f"✅ 已加载现有参数\n来源: {os.path.basename(path)}"
+                f"✅ 已加载现有参数\n来源: {os.path.basename(path)}\n"
+                f"模型: {self._model}  分辨率: {self._calib_size[0]}×{self._calib_size[1]}"
             )
+
+            # --- 新增：导入后自动询问并保存到历史记录 ---
+            dlg = CustomInputDialog("保存导入参数", "已成功读取 YAML，建议将其存入历史记录以便后续直接调用：", self)
+            dlg.line_edit.setText(os.path.splitext(os.path.basename(path))[0]) # 默认使用文件名
+            if dlg.exec_() == QDialog.Accepted and dlg.get_text():
+                HistoryManager().add_calibration_record(
+                    name=dlg.get_text(),
+                    image_count=0,  # 外部导入标记为 0 张图片
+                    avg_error=0.0,
+                    K=self._K,
+                    D=self._D,
+                    model=self._model,
+                    image_size=self._calib_size,
+                )
+                # 刷新历史记录页面
+                mw = self._main_window()
+                if mw:
+                    mw.history_interface.load_data()
+            # ----------------------------------------
+
         except Exception as e:
             QMessageBox.warning(self, "读取失败", str(e))
 
@@ -235,6 +259,8 @@ class CalibrationInterface(QFrame):
         self._calib_engine.reset()
         self._K = DEFAULT_K.copy()
         self._D = DEFAULT_D.copy()
+        self._model = "pinhole"
+        self._calib_size = (640, 480)
         self.btn_calibrate.setEnabled(False)
         self.photo_wall.clear()
         self.calib_status_label.setText("状态: 未标定 (使用默认参数)")

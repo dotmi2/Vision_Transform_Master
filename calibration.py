@@ -14,12 +14,18 @@ class CalibrationEngine:
         self.camera_matrix: Optional[np.ndarray] = None
         self.dist_coeffs: Optional[np.ndarray] = None
         self.reprojection_error: float = 0.0
+        self.model: str = "pinhole"
 
     def add_image(self, frame: np.ndarray, board_manager) -> Tuple[bool, str]:
         """Add calibration image"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
-        self.image_size = (w, h)
+        current_size = (w, h)
+
+        if self.image_size is None:
+            self.image_size = current_size
+        elif self.image_size != current_size:
+            return False, f"Image size mismatch: expected {self.image_size}, got {current_size}"
 
         # Detect corners
         corners, ids = board_manager.detect_corners(gray)
@@ -74,14 +80,12 @@ class CalibrationEngine:
             objp_list, imgp_list, self.image_size, K, D, criteria=criteria
         )
 
-        # Calculate error
-        error = self._calc_error_pinhole(objp_list, imgp_list, rvecs, tvecs, K, D)
-
         self.camera_matrix = K
         self.dist_coeffs = D
-        self.reprojection_error = error
+        self.reprojection_error = float(ret)
+        self.model = "pinhole"
 
-        return True, f"Calibration successful! Error: {error:.4f}px"
+        return True, f"Calibration successful! Error: {self.reprojection_error:.4f}px"
 
     def _calibrate_fisheye(self) -> Tuple[bool, str]:
         """Fisheye calibration"""
@@ -101,35 +105,38 @@ class CalibrationEngine:
             flags=cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC, criteria=criteria
         )
 
-        error = self._calc_error_fisheye(objp_list, imgp_list, rvecs, tvecs, K, D)
-
         self.camera_matrix = K
         self.dist_coeffs = D
-        self.reprojection_error = error
+        self.reprojection_error = float(ret)
+        self.model = "fisheye"
 
-        return True, f"Fisheye calibration successful! Error: {error:.4f}px"
+        return True, f"Fisheye calibration successful! Error: {self.reprojection_error:.4f}px"
 
     def _calc_error_pinhole(self, objp, imgp, rvecs, tvecs, K, D) -> float:
         """Calculate reprojection error"""
-        total_error = 0
+        total_error_sq = 0.0
         total_points = 0
         for i in range(len(objp)):
             proj, _ = cv2.projectPoints(objp[i], rvecs[i], tvecs[i], K, D)
-            error = cv2.norm(imgp[i], proj, cv2.NORM_L2) / len(proj)
-            total_error += error * len(objp[i])
-            total_points += len(objp[i])
-        return total_error / total_points
+            error = cv2.norm(imgp[i], proj, cv2.NORM_L2)
+            total_error_sq += error * error
+            total_points += len(proj)
+        if total_points == 0:
+            return 0.0
+        return float(np.sqrt(total_error_sq / total_points))
 
     def _calc_error_fisheye(self, objp, imgp, rvecs, tvecs, K, D) -> float:
         """Calculate fisheye reprojection error"""
-        total_error = 0
+        total_error_sq = 0.0
         total_points = 0
         for i in range(len(objp)):
             proj, _ = cv2.fisheye.projectPoints(objp[i], rvecs[i], tvecs[i], K, D)
-            error = cv2.norm(imgp[i], proj, cv2.NORM_L2) / len(proj)
-            total_error += error * len(objp[i])
-            total_points += len(objp[i])
-        return total_error / total_points
+            error = cv2.norm(imgp[i], proj, cv2.NORM_L2)
+            total_error_sq += error * error
+            total_points += len(proj)
+        if total_points == 0:
+            return 0.0
+        return float(np.sqrt(total_error_sq / total_points))
 
     def save_yaml(self, filepath: str, model: str):
         """Save calibration to YAML"""
@@ -141,6 +148,7 @@ class CalibrationEngine:
         fs.write("image_height", self.image_size[1])
         fs.write("model", model)
         fs.write("camera_matrix", self.camera_matrix)
+        fs.write("dist_coeffs", self.dist_coeffs)
         fs.write("distortion_coefficients", self.dist_coeffs)
         fs.write("reprojection_error", float(self.reprojection_error))
         fs.release()
@@ -152,6 +160,11 @@ class CalibrationEngine:
 
         K = self.camera_matrix
         D = self.dist_coeffs.flatten()
+        model = camera_params.get("model", self.model)
+        if model == "fisheye":
+            undistort_line = "cv::fisheye::undistortImage(frame, undistorted, K, D, K);"
+        else:
+            undistort_line = "cv::undistort(frame, undistorted, K, D);"
 
         return f"""#include <opencv2/opencv.hpp>
 
@@ -170,7 +183,8 @@ int main() {{
     cv::Mat frame, undistorted;
     while(true) {{
         cap >> frame;
-        cv::undistort(frame, undistorted, K, D);
+        if(frame.empty()) break;
+        {undistort_line}
         cv::imshow("Undistorted", undistorted);
         if(cv::waitKey(1) == 'q') break;
     }}
@@ -185,3 +199,4 @@ int main() {{
         self.camera_matrix = None
         self.dist_coeffs = None
         self.reprojection_error = 0.0
+        self.model = "pinhole"
